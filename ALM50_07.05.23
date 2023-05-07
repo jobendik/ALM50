@@ -1,0 +1,456 @@
+#property version   "1.00"
+#property strict
+#include <Trade\Trade.mqh>
+#include <Arrays\ArrayObj.mqh>
+input double BasePrice = 1.12500;
+input int NumLines = 50;
+input int PipsDistance = 50;
+input double RiskPerProgression = 0.01;
+double progression_table[6][5];
+int _lot_digits = 2;
+int ExpertMagicNumber = 123456;
+int wins = 0;int losses = 0;int winIndex = 0;int lossIndex = 0;
+int lastProfitLevel = -1;
+int numProfitLevels = 0;
+static int lastBuyLevel = -1;
+static int lastSellLevel = -1;
+double previousAccountBalance = 0;
+double priceLevels[];
+double progressionRiskCapital;
+double riskPercentage;
+double startProgressionBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+double contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+double valuePerPip = pointSize * contractSize;
+
+static double prevAsk = 0;
+static double prevBid = 0;
+static bool firstTick = true;
+static int totalProgressions = 0;
+static int wonProgressions = 0;
+CTrade trade;
+double last_stop_loss = -1.0;
+
+int OnInit(){
+double temp[][5] = {
+    {19.75, 17.55, 13.17, 07.52, 02.51},
+    {21.94, 21.94, 18.81, 12.54, 05.02},
+    {21.94, 25.08, 25.08, 20.06, 10.03},
+    {18.81, 25.08, 30.09, 30.09, 20.06},
+    {12.54, 20.06, 30.09, 40.13, 40.13},
+    {05.02, 10.03, 20.06, 40.13, 80.25}};
+   ArrayCopy(progression_table, temp);
+ 
+   double initialAccountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   progressionRiskCapital = initialAccountBalance * (RiskPerProgression / 1000);
+   
+   ArrayResize(priceLevels, 2 * NumLines + 1);
+   for (int i = -NumLines; i <= NumLines; ++i){
+      double price = BasePrice + i * PipsDistance * pointSize * 10;
+      priceLevels[i + NumLines] = price;
+      string lineName = "DottedLine_" + IntegerToString(i + NumLines);
+      ObjectCreate(0, lineName, OBJ_HLINE, 0, 0, price);
+      ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(0, lineName, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, lineName, OBJPROP_COLOR, clrBlue);}
+   return(INIT_SUCCEEDED);}
+
+void createOrUpdateTextObject(string objectName, string text, int x, int y) {
+    if (ObjectFind(0, objectName) == -1) {
+        ObjectCreate(0, objectName, OBJ_LABEL, 0, 0, 0);
+        ObjectSetInteger(0, objectName, OBJPROP_XDISTANCE, x);
+        ObjectSetInteger(0, objectName, OBJPROP_YDISTANCE, y);
+        ObjectSetInteger(0, objectName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+        ObjectSetInteger(0, objectName, OBJPROP_FONTSIZE, 15);}
+        ObjectSetString(0, objectName, OBJPROP_TEXT, text);}
+
+void CreateNewLevels(double price, bool isAbove){
+    while (isAbove ? price > priceLevels[ArraySize(priceLevels) - 1] : price < priceLevels[0]){
+        int newIndex = isAbove ? ArraySize(priceLevels) : 0;
+        double newPrice = isAbove ? priceLevels[newIndex - 1] + PipsDistance * pointSize * 10
+                                  : priceLevels[0] - PipsDistance * pointSize * 10; 
+        if (isAbove){
+            ArrayResize(priceLevels, ArraySize(priceLevels) + 1);
+            priceLevels[newIndex] = newPrice;
+        }else{
+            ArrayResize(priceLevels, ArraySize(priceLevels) + 1, 0);
+            priceLevels[0] = newPrice;}
+        string lineName = "DottedLine_" + IntegerToString(newIndex);
+        ObjectCreate(0, lineName, OBJ_HLINE, 0, 0, newPrice);
+        ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_DOT);
+        ObjectSetInteger(0, lineName, OBJPROP_WIDTH, 1);
+        ObjectSetInteger(0, lineName, OBJPROP_COLOR, clrBlue);}}
+
+int getNearestIndex(double currentPrice, double& Levels[], ENUM_POSITION_TYPE type) {
+    int nearestIndex = -1;
+    double minDistance = DBL_MAX;
+    for (int t = 0; t < ArraySize(priceLevels); ++t) {
+        double distance = 0;
+        if (type == POSITION_TYPE_BUY) {
+            distance = currentPrice - priceLevels[t];
+        } else if (type == POSITION_TYPE_SELL) {
+            distance = priceLevels[t] - currentPrice;
+        }if (distance > 0 && distance < minDistance) {
+            minDistance = distance;
+            nearestIndex = t;
+        }
+    }
+    return nearestIndex;
+}
+
+void getNewStopLoss(double& newStopLoss, double currentPrice, int nearestIndex, double& Levels[], ENUM_POSITION_TYPE type) {
+    int nextIndex = (type == POSITION_TYPE_BUY) ? nearestIndex - 1 : nearestIndex + 1;
+    if (nextIndex >= 0 && nextIndex < ArraySize(priceLevels)) {
+        double pipsToNextLevel = MathAbs((priceLevels[nextIndex] - currentPrice) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10));
+        if (pipsToNextLevel >= PipsDistance) {
+            newStopLoss = NormalizeDouble(priceLevels[nextIndex], (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+        }
+    }
+}
+
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result){
+    if (trans.type == TRADE_TRANSACTION_DEAL_ADD){
+        if (trans.deal_type == DEAL_TYPE_SELL || trans.deal_type == DEAL_TYPE_BUY){
+            ulong deal_ticket = trans.deal;
+            long deal_reason;
+            if (HistoryDealSelect(deal_ticket) && HistoryDealGetInteger(deal_ticket, DEAL_REASON, deal_reason)){
+                if (deal_reason == DEAL_REASON_SL){
+                    resetOrders();                        
+                    double stop_loss = PositionGetDouble(POSITION_SL);
+                    if (stop_loss != last_stop_loss) {
+                        losses++;
+                        lossIndex++;
+                        last_stop_loss = stop_loss;
+                        Print("TEST: SL TRIGGERED! LOSSES: ", losses, " Lossindex: ", lossIndex);
+                        printWinLossStatus();
+                    }
+                }
+            }
+        }
+    }
+}
+
+void closeAllPositions(){
+   int positions = 0;
+   for(int j = PositionsTotal() - 1; j >= 0; j--){
+      ulong posTicket = PositionGetTicket(j);
+      if(PositionSelectByTicket(posTicket)){
+        ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        if (PositionGetString(POSITION_SYMBOL) == _Symbol) {
+           trade.PositionClose(posTicket);
+           Print("____  ALL POSITIONS CLOSED");
+         }
+      }
+   }
+}
+
+void OnTick() {
+  if(losses == 6){
+     printWinLossStatus();
+     wins = 0;
+     winIndex = 0;
+     losses = 0;
+     lossIndex = 0;
+     closeAllPositions();
+     resetOrders();
+}
+  double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+  double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+  
+   int positions = 0;
+   for(int j = PositionsTotal() - 1; j >= 0; j--){
+      ulong posTicket = PositionGetTicket(j);
+      if(PositionSelectByTicket(posTicket)){
+        ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        if (PositionGetString(POSITION_SYMBOL) == _Symbol) {    
+            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            double currentSL = PositionGetDouble(POSITION_SL);
+            double currentTP = PositionGetDouble(POSITION_TP);
+            double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+            double newStopLoss = currentSL;
+            int nearestIndex = getNearestIndex(currentPrice, priceLevels, type);       
+            getNewStopLoss(newStopLoss, currentPrice, nearestIndex, priceLevels, type);
+     
+        if (type == POSITION_TYPE_BUY && currentSL < newStopLoss) {
+           if (wins == 5) {
+              printWinLossStatus();
+              wins = 0;
+              winIndex = 0;
+              losses = 0;
+              lossIndex = 0;
+              resetOrders();
+              closeAllPositions();
+           }else{
+              wins++;
+              if (winIndex < 4){
+                 winIndex++;
+              }
+           }    
+           if (wins != 5) {
+              modifyBuy(posTicket, newStopLoss, ask);
+              placeSellStopOrder(calculateLotSize(), priceLevels[nearestIndex - 1]);
+           }
+       
+        }else if (type == POSITION_TYPE_SELL && currentSL > newStopLoss){
+           if (wins == 5) {
+              printWinLossStatus();
+              wins = 0;
+              winIndex = 0;
+              losses = 0;
+              lossIndex = 0;
+              resetOrders();
+              closeAllPositions();
+           }else{
+              wins++;
+              if (winIndex < 4) {
+                 winIndex++;
+              }
+           }   
+           if (wins != 5) {
+               modifySell(posTicket, newStopLoss, bid);
+               placeBuyStopOrder(calculateLotSize(), priceLevels[nearestIndex + 1]);
+           }
+         }
+      }
+    }
+   }
+     managePendingAndOpenOrders(bid, ask);
+}
+
+void managePendingAndOpenOrders(double bid, double ask) {
+  bool hasBuyStop = false;
+  bool hasSellStop = false;
+  bool hasBuyPosition = false;
+  bool hasSellPosition = false;
+
+  // Check for existing pending orders
+  for (int i = 0; i < OrdersTotal(); i++) {
+    ulong orderTicket = OrderGetTicket(i);
+    if (OrderSelect(orderTicket)) {
+      if (OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == ExpertMagicNumber) {
+        if (OrderGetInteger(ORDER_TYPE) == ORDER_TYPE_BUY_STOP) {
+          hasBuyStop = true;
+        } else if (OrderGetInteger(ORDER_TYPE) == ORDER_TYPE_SELL_STOP) {
+          hasSellStop = true;
+        }
+      }
+    }
+  }
+
+  // Check for existing open positions
+  for (int j = PositionsTotal() - 1; j >= 0; j--){
+    ulong posTicket = PositionGetTicket(j);
+    if(PositionSelectByTicket(posTicket)){
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if (PositionGetString(POSITION_SYMBOL) == _Symbol) {
+        if (type == POSITION_TYPE_BUY) {
+          hasBuyPosition = true;
+        } else if (type == POSITION_TYPE_SELL) {
+          hasSellPosition = true;
+        }
+      }
+    }
+  }
+
+  if (!hasBuyStop && !hasSellStop && !hasBuyPosition && !hasSellPosition) {
+    double lotSize = calculateLotSize();
+
+    if (lastProfitLevel == -1 || lastProfitLevel == POSITION_TYPE_SELL) {
+      int buyLevel = getNearestIndex(ask, priceLevels, POSITION_TYPE_BUY) + 1;
+      double buyStopPrice = priceLevels[buyLevel];
+      placeBuyStopOrder(lotSize, buyStopPrice);
+    }
+
+    if (lastProfitLevel == -1 || lastProfitLevel == POSITION_TYPE_BUY) {
+      int sellLevel = getNearestIndex(bid, priceLevels, POSITION_TYPE_SELL) - 1;
+      double sellStopPrice = priceLevels[sellLevel];
+      placeSellStopOrder(lotSize, sellStopPrice);
+    }
+  }
+}
+
+void placeBuyStopOrder(double lotSize, double buyStopPrice){
+  MqlTradeRequest buyReq;
+  ZeroMemory(buyReq);
+  buyReq.action = TRADE_ACTION_PENDING;
+  buyReq.type = ORDER_TYPE_BUY_STOP;
+  buyReq.symbol = _Symbol;
+  buyReq.volume = lotSize;
+  buyReq.price = buyStopPrice;
+  buyReq.sl = buyStopPrice - PipsDistance * pointSize * 10;
+  buyReq.tp = 0;
+  buyReq.magic = ExpertMagicNumber;
+
+  for (int i = 0; i < OrdersTotal(); i++) {
+    ulong orderTicket = OrderGetTicket(i);
+    if (OrderSelect(orderTicket)) {
+      if (OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == ExpertMagicNumber && OrderGetInteger(ORDER_TYPE) == ORDER_TYPE_BUY_STOP) {
+        trade.OrderDelete(orderTicket);
+      }
+    }
+  }
+
+  MqlTradeResult buyRes;
+  ZeroMemory(buyRes);
+  trade.OrderSend(buyReq, buyRes);
+}
+
+void placeSellStopOrder(double lotSize, double sellStopPrice) {
+  MqlTradeRequest sellReq;
+  ZeroMemory(sellReq);
+  sellReq.action = TRADE_ACTION_PENDING;
+  sellReq.type = ORDER_TYPE_SELL_STOP;
+  sellReq.symbol = _Symbol;
+  sellReq.volume = lotSize;
+  sellReq.price = sellStopPrice;
+  sellReq.sl = sellStopPrice + PipsDistance * pointSize * 10;
+  sellReq.tp = 0;
+  sellReq.magic = ExpertMagicNumber;
+
+  for (int i = 0; i < OrdersTotal(); i++) {
+    ulong orderTicket = OrderGetTicket(i);
+    if (OrderSelect(orderTicket)) {
+      if (OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == ExpertMagicNumber && OrderGetInteger(ORDER_TYPE) == ORDER_TYPE_SELL_STOP) {
+        trade.OrderDelete(orderTicket);
+      }
+    }
+  }
+
+  MqlTradeResult sellRes;
+  ZeroMemory(sellRes);
+  trade.OrderSend(sellReq, sellRes);
+}
+
+void resetOrders() {
+  for (int i = 0; i < OrdersTotal(); i++) {
+    ulong orderTicket = OrderGetTicket(i);
+    if (OrderSelect(orderTicket)) {
+      if (OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == ExpertMagicNumber) {
+        trade.OrderDelete(orderTicket);
+      }
+    }
+  }
+}
+
+void modifyBuy(ulong posTicket, double newStopLoss, double ask){
+   
+   if(winIndex < 4){
+      if (progression_table[lossIndex][winIndex + 1] > progression_table[lossIndex][winIndex]) {
+         double deltaRiskPercentage3 = progression_table[lossIndex][winIndex + 1] - progression_table[lossIndex][winIndex];
+         double increasedLotsizeBuy = NormalizeDouble((deltaRiskPercentage3 / (PipsDistance * valuePerPip) /2), 2);                                   
+         trade.PositionModify(posTicket, newStopLoss, 0);
+         trade.Buy(increasedLotsizeBuy, _Symbol, ask, newStopLoss, 0);
+         Print("____ADDED ",  increasedLotsizeBuy, " TO BUY POSITION. POSITION RISK: ", progression_table[lossIndex][winIndex]);
+         printWinLossStatus();
+
+      }else if(progression_table[lossIndex][winIndex +1] < progression_table[lossIndex][winIndex]){                  
+         double deltaRiskPercentage2 = progression_table[lossIndex][winIndex] - progression_table[lossIndex][winIndex + 1];
+         double partialLotSize2 = deltaRiskPercentage2 / (PipsDistance * valuePerPip);
+         trade.PositionClosePartial(posTicket, NormalizeDouble(partialLotSize2, 2));
+         trade.PositionModify(posTicket, newStopLoss, 0);
+         Print("____CLOSE PARTIAL BUY. POSITION RISK: ", progression_table[lossIndex][winIndex]);
+         printWinLossStatus();
+      }else{
+         trade.PositionModify(posTicket, newStopLoss, 0);                  
+         Print("____POSITION RISK: ", progression_table[lossIndex][winIndex]);
+         printWinLossStatus();
+      }
+   }
+   if(winIndex == 4){
+      if (progression_table[lossIndex][winIndex - 1] > progression_table[lossIndex][winIndex]) {
+         double temp = progression_table[lossIndex][winIndex - 1] - progression_table[lossIndex][winIndex];                  
+         double partialclosepercentage = progression_table[lossIndex][winIndex - 1] - temp;                  
+         double partialLotSize3 = partialclosepercentage / (PipsDistance * valuePerPip);
+         trade.PositionClosePartial(posTicket, NormalizeDouble(partialLotSize3, 2));
+         trade.PositionModify(posTicket, newStopLoss, 0);
+         Print("____CLOSE PARTIAL BUY. POSITION RISK: ", progression_table[lossIndex][winIndex]);
+         printWinLossStatus();
+      }else if(progression_table[lossIndex][winIndex -1] < progression_table[lossIndex][winIndex]){                  
+         double temp2 = progression_table[lossIndex][winIndex-1] + progression_table[lossIndex][winIndex];
+         double partialclosepercentage = progression_table[lossIndex][winIndex - 1] + temp2;          
+         double partialLotSize4 = partialclosepercentage / (PipsDistance * valuePerPip);
+         trade.PositionClosePartial(posTicket, NormalizeDouble(partialLotSize4, 2));
+         trade.PositionModify(posTicket, newStopLoss, 0);
+         Print("____CLOSE PARTIAL BUY. POSITION RISK: ", progression_table[lossIndex][winIndex]);
+         printWinLossStatus();
+        }            
+     }
+}
+
+void modifySell(ulong posTicket, double newStopLoss, double bid){
+   if(winIndex < 4){
+      if(progression_table[lossIndex][winIndex + 1] > progression_table[lossIndex][winIndex]) {
+        double deltaRiskPercentage4 = progression_table[lossIndex][winIndex + 1] - progression_table[lossIndex][winIndex];
+        double increasedLotsizeSell = NormalizeDouble((deltaRiskPercentage4 / (PipsDistance * valuePerPip) /2), 2);                                   
+        trade.PositionModify(posTicket, newStopLoss, 0);
+        trade.Sell(increasedLotsizeSell, _Symbol, bid, newStopLoss, 0);
+        Print("____ADDED ", increasedLotsizeSell, " TO SELL POSITION. POSITION RISK: ", progression_table[lossIndex][winIndex]);
+        printWinLossStatus();
+     }else if(progression_table[lossIndex][winIndex +1] < progression_table[lossIndex][winIndex]){
+        Print("CLOSE PARTIAL SELL!---------------");
+        double deltaRiskPercentage = progression_table[lossIndex][winIndex] - progression_table[lossIndex][winIndex + 1];
+        double partialLotSize = deltaRiskPercentage / (PipsDistance * valuePerPip);
+        Print("Deltariskpercentage: ", deltaRiskPercentage, " Partial lot size: ", partialLotSize);
+        trade.PositionClosePartial(posTicket, NormalizeDouble(partialLotSize, 2));
+        trade.PositionModify(posTicket, newStopLoss, 0);
+        printWinLossStatus();
+        Print("____POSITION RISK: ", progression_table[lossIndex][winIndex]);                                 
+     }else{
+         Print("____POSITION RISK: ", progression_table[lossIndex][winIndex]);
+         trade.PositionModify(posTicket, newStopLoss, 0);                  
+         printWinLossStatus();
+     }
+  }
+  if(winIndex == 4){
+      if (progression_table[lossIndex][winIndex - 1] > progression_table[lossIndex][winIndex]) {
+         double temp = progression_table[lossIndex][winIndex - 1] - progression_table[lossIndex][winIndex];                  
+         double partialclosepercentage = progression_table[lossIndex][winIndex - 1] - temp;                  
+         double partialLotSize3 = partialclosepercentage / (PipsDistance * valuePerPip);
+         trade.PositionClosePartial(posTicket, NormalizeDouble(partialLotSize3, 2));
+         trade.PositionModify(posTicket, newStopLoss, 0);
+         Print("Temp: ", temp, " Partialclosep: ", partialclosepercentage, " Partiallotsize: ", partialLotSize3);
+         Print("___CLOSE PARTIAL SELL. POSITION RISK: ", progression_table[lossIndex][winIndex]);
+         printWinLossStatus();
+      }else if(progression_table[lossIndex][winIndex -1] < progression_table[lossIndex][winIndex]){                  
+         double temp2 = progression_table[lossIndex][winIndex-1] + progression_table[lossIndex][winIndex];
+         double partialclosepercentage = progression_table[lossIndex][winIndex - 1] + temp2;        
+         double partialLotSize4 = partialclosepercentage / (PipsDistance * valuePerPip);
+         trade.PositionClosePartial(posTicket, NormalizeDouble(partialLotSize4, 2));
+         trade.PositionModify(posTicket, newStopLoss, 0);
+         Print("____CLOSE PARTIAL SELL. POSITION RISK: ", progression_table[lossIndex][winIndex]);
+         printWinLossStatus();
+     }            
+  }
+}
+
+double calculateLotSize() {
+    riskPercentage = progression_table[lossIndex][winIndex] * progressionRiskCapital;
+    double lotSize = riskPercentage / (PipsDistance * valuePerPip);
+    Print("___RISK FROM CALCULATELOTSIZE AFTER LOSS: ", riskPercentage);
+    return NormalizeDouble(lotSize, 2);
+}
+
+void printWinLossStatus() {
+    double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    createOrUpdateTextObject("TotalProgressions", "Total Progressions: " + IntegerToString(totalProgressions), 10, 10);
+    createOrUpdateTextObject("WonProgressions", "Won Progressions: " + IntegerToString(wonProgressions), 10, 30);
+    createOrUpdateTextObject("LostProgressions", "Lost Progressions: " + IntegerToString(totalProgressions - wonProgressions), 10, 50);
+    createOrUpdateTextObject("Wins", "Wins: " + IntegerToString(wins), 10, 70);
+    createOrUpdateTextObject("winIndex", "Wins Index: " + IntegerToString(winIndex), 10, 110);
+    createOrUpdateTextObject("Losses", "Losses: " + IntegerToString(losses), 10, 90);    
+    createOrUpdateTextObject("lossIndex", "Losses Index: " + IntegerToString(lossIndex), 10, 130);    
+    if (wins == 5) {
+        double progressionProfit = accountBalance - startProgressionBalance;
+        startProgressionBalance = accountBalance;
+        totalProgressions++;
+        wonProgressions++;
+        Print("-*-*--*-*-*-*-PROGRESSION won-*-*-*-*-*-*-. All levels reached. Wins: ", wins, ", Losses: ", losses, ". Profit: $", NormalizeDouble(progressionProfit, 2));
+    }else if (losses == 6){
+        double progressionLoss = startProgressionBalance - accountBalance;
+        startProgressionBalance = accountBalance;
+        totalProgressions++;
+        Print("-*-*-*-*-*-*-*-*-*-*-*----PROGRESSION lost-*-*-*-*-*-*-*-*-*-*-*. Maximum losses reached. Wins: ", wins, ", Losses: ", losses, ". Loss: $", NormalizeDouble(progressionLoss, 2));
+    }else{
+        Print("____PROGRESSION: ", wins, " wins, ", losses, " losses. ");}
+}
